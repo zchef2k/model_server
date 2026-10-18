@@ -284,11 +284,18 @@ Status ContinuousBatchingServableInitializer::initialize(std::shared_ptr<GenAiSe
     }
     properties->tokenizerPluginConfig = tokenProperties;
 
-    try {
-        properties->pipeline = std::make_shared<ov::genai::ContinuousBatchingPipeline>(parsedModelsPath,
+    auto pipeFactory = [properties]() -> std::shared_ptr<ov::genai::ContinuousBatchingPipeline> {
+        return std::make_shared<ov::genai::ContinuousBatchingPipeline>(properties->modelsPath,
             properties->schedulerConfig, properties->device,
             properties->pluginConfig, properties->tokenizerPluginConfig);
-        properties->tokenizer = properties->pipeline->get_tokenizer();
+    };
+    auto onPipelineCreated = [properties](const std::shared_ptr<ov::genai::ContinuousBatchingPipeline>& pipe) {
+        properties->tokenizer = pipe->get_tokenizer();
+    };
+
+    properties->llmExecutorWrapper = std::make_shared<LLMExecutorWrapper>(pipeFactory, onPipelineCreated, properties->schedulerConfig.cache_size == 0);
+    try {
+        properties->llmExecutorWrapper->getReadyFuture().get();
     } catch (const std::exception& e) {
         SPDLOG_ERROR("Error during llm node initialization for models_path: {} exception: {}", parsedModelsPath, e.what());
         return StatusCode::LLM_NODE_RESOURCE_STATE_INITIALIZATION_FAILED;
@@ -304,8 +311,6 @@ Status ContinuousBatchingServableInitializer::initialize(std::shared_ptr<GenAiSe
         properties->maxTokensLimit = nodeOptions.max_tokens_limit();
     }
     properties->maxModelLength = parseMaxModelLength(parsedModelsPath);
-
-    properties->llmExecutorWrapper = std::make_shared<LLMExecutorWrapper>(properties->pipeline, properties->schedulerConfig.cache_size == 0);
 
     return StatusCode::OK;
 }

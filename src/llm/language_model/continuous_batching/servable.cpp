@@ -14,9 +14,13 @@
 // limitations under the License.
 //*****************************************************************************
 
+#include <algorithm>
+#include <chrono>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "../../../logging.hpp"
@@ -74,9 +78,19 @@ absl::Status ContinuousBatchingServable::addRequestToPipeline(std::shared_ptr<Co
         return absl::InvalidArgumentError("Input length exceeds pipeline capabilities: " + std::to_string(executionContext->inputRequest.inputIds.get_size()) +
                                           " > " + std::to_string(properties->schedulerConfig.max_num_batched_tokens));
     }
-    executionContext->generationHandle = properties->pipeline->add_request(currentRequestId++,
-        executionContext->inputRequest.inputIds,
-        executionContext->inputRequest.generationConfig);
+    uint64_t requestId = currentRequestId++;
+    try {
+        executionContext->generationHandle = properties->llmExecutorWrapper->executeSynchronously(
+            [this, requestId, &executionContext](ov::genai::ContinuousBatchingPipeline* pipe) {
+                return pipe->add_request(requestId,
+                    executionContext->inputRequest.inputIds,
+                    executionContext->inputRequest.generationConfig);
+            });
+        properties->llmExecutorWrapper->registerActiveHandle(executionContext->generationHandle);
+    } catch (const std::exception& e) {
+        SPDLOG_LOGGER_ERROR(llm_calculator_logger, "Failed to add request {} to the pipeline: {}.", requestId, e.what());
+        return absl::InternalError("Failed to add request to the pipeline");
+    }
     return absl::OkStatus();
 }
 
@@ -118,17 +132,88 @@ static ov::genai::GenerationOutput prepareEmptyStopReasonOutput() {
     return out;
 }
 
+namespace {
+// Non-blocking equivalent of GenAI's GenerationHandleImpl::read_all().
+// read_all() blocks in the stream queue waiting for the next token chunk, so when the
+// step loop dies (e.g. LA cache capacity exhaustion on GPU) an in-flight unary request
+// would hang forever. Here we poll, merge partial outputs, and bail out the moment the
+// pipeline is marked as failed, draining whatever was already produced.
+void mergePartialOutputs(std::unordered_map<uint64_t, ov::genai::GenerationOutput>& partial,
+    const ov::genai::GenerationOutputs& iteration) {
+    for (auto& entry : iteration) {
+        auto partialIter = partial.find(entry.first);
+        if (partialIter == partial.end()) {
+            partial.emplace(entry.first, entry.second);
+        } else {
+            auto generatedLen = entry.second.generated_ids.size();
+            for (size_t i = 0; i < generatedLen; ++i) {
+                partialIter->second.generated_ids.push_back(entry.second.generated_ids[i]);
+                partialIter->second.generated_log_probs.push_back(entry.second.generated_log_probs[i]);
+            }
+            partialIter->second.score = entry.second.score;
+            partialIter->second.finish_reason = entry.second.finish_reason;
+            if (!entry.second.intermediate_hidden_states.empty()) {
+                partialIter->second.intermediate_hidden_states = entry.second.intermediate_hidden_states;
+            }
+        }
+    }
+}
+
+std::vector<ov::genai::GenerationOutput> collectOutputsNonBlocking(const ov::genai::GenerationHandle& handle,
+    LLMExecutorWrapper* executorWrapper) {
+    std::unordered_map<uint64_t, ov::genai::GenerationOutput> partial;
+    for (;;) {
+        try {
+            if (executorWrapper->isPipelineFailed()) {
+                break;
+            }
+            if (handle->get_status() != ov::genai::GenerationStatus::RUNNING) {
+                break;
+            }
+            if (handle->can_read()) {
+                mergePartialOutputs(partial, handle->read());
+                continue;
+            }
+        } catch (...) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    // Drain any chunk(s) buffered after the exit condition (final result or failure).
+    for (;;) {
+        try {
+            if (!handle->can_read()) {
+                break;
+            }
+            mergePartialOutputs(partial, handle->read());
+        } catch (...) {
+            break;
+        }
+    }
+    std::vector<ov::genai::GenerationOutput> results;
+    results.reserve(partial.size());
+    for (auto& entry : partial) {
+        results.emplace_back(std::move(entry.second));
+    }
+    return results;
+}
+}  // namespace
+
 absl::Status ContinuousBatchingServable::readCompleteExecutionResults(std::shared_ptr<GenAiServableExecutionContext>& executionContext) {
     auto cbExecutionContext = std::static_pointer_cast<ContinuousBatchingServableExecutionContext>(executionContext);
     if (cbExecutionContext->payload.client->isDisconnected()) {
         return absl::CancelledError();
     }
 
-    cbExecutionContext->generationOutputs = cbExecutionContext->generationHandle->read_all();
+    cbExecutionContext->generationOutputs = collectOutputsNonBlocking(cbExecutionContext->generationHandle, properties->llmExecutorWrapper.get());
     if (cbExecutionContext->generationHandle->get_status() == ov::genai::GenerationStatus::STOP) {
         return absl::CancelledError();
     }
     if (cbExecutionContext->generationOutputs.size() == 0) {
+        if (properties->llmExecutorWrapper->isPipelineFailed()) {
+            SPDLOG_LOGGER_ERROR(llm_calculator_logger, "LLM generation pipeline failed before any output was produced.");
+            return absl::InternalError("LLM generation pipeline failed");
+        }
         cbExecutionContext->generationOutputs = {prepareEmptyStopReasonOutput()};
     }
     executionContext->perfMetrics = std::make_unique<ov::genai::PerfMetrics>(cbExecutionContext->generationHandle->get_perf_metrics());
@@ -144,6 +229,11 @@ absl::Status ContinuousBatchingServable::readPartialExecutionResults(std::shared
     // Each iteration is single execution of Process() method in the calculator
     if (cbExecutionContext->generationHandle->get_status() == ov::genai::GenerationStatus::STOP) {
         return absl::CancelledError();
+    }
+    // A dead step loop would leave the stream queue empty forever and a blocking read()
+    // would hang the request; fail fast instead and let the client terminate the stream.
+    if (properties->llmExecutorWrapper->isPipelineFailed()) {
+        return absl::InternalError("LLM generation pipeline failed");
     }
 
     if (cbExecutionContext->generationHandle->get_status() == ov::genai::GenerationStatus::RUNNING || cbExecutionContext->generationHandle->can_read()) {

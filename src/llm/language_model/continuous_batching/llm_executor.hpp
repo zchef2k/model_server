@@ -16,13 +16,20 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <exception>
+#include <future>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 
 #include <openvino/genai/continuous_batching_pipeline.hpp>
@@ -44,17 +51,26 @@ struct LLMExecutor {
     }
 
     bool hasRequests() {
-        return (pipe->has_non_finished_requests());
+        return pipe && pipe->has_non_finished_requests();
     }
 
     void step() {
         OVMS_PROFILE_FUNCTION();
-        pipe->step();
+        if (pipe) {
+            pipe->step();
+        }
     }
 
     void waitForRequests(std::atomic<bool>* receivedEndSignal) {
+        waitForRequests(receivedEndSignal, nullptr);
+    }
+
+    void waitForRequests(std::atomic<bool>* receivedEndSignal, const std::function<bool()>& isTaskPending) {
         std::unique_lock<std::mutex> lock(mutex);
-        cv.wait(lock, [this, receivedEndSignal] { return (pipe->has_non_finished_requests() || *receivedEndSignal); });
+        cv.wait(lock, [this, receivedEndSignal, &isTaskPending] {
+            return (pipe && pipe->has_non_finished_requests()) || *receivedEndSignal ||
+                (isTaskPending && isTaskPending());
+        });
     }
 
     void notify() {
@@ -111,26 +127,90 @@ class LLMExecutorWrapper {
     LLMExecutor llmExecutor;
     std::thread llmExecutorThread;
     std::atomic<bool> finishExecutorThread = false;
+    std::function<std::shared_ptr<ov::genai::ContinuousBatchingPipeline>()> pipeFactory;
+    std::function<void(const std::shared_ptr<ov::genai::ContinuousBatchingPipeline>&)> onPipelineCreated;
+    std::promise<void> pipelineReady;
+    std::future<void> readyFuture = pipelineReady.get_future();
+    std::mutex taskMutex;
+    std::deque<std::function<void(ov::genai::ContinuousBatchingPipeline*)>> pendingTasks;
+    std::atomic<bool> stepFailed = false;
+    std::vector<ov::genai::GenerationHandle> activeHandles;
+    std::function<void()> onStepError;
 
-    static void run(LLMExecutor* llmExecutor, std::atomic<bool>* receivedEndSignal) {
+    void drainTasks() {
+        while (true) {
+            std::function<void(ov::genai::ContinuousBatchingPipeline*)> task;
+            {
+                std::lock_guard<std::mutex> lock(taskMutex);
+                if (pendingTasks.empty()) {
+                    return;
+                }
+                task = std::move(pendingTasks.front());
+                pendingTasks.pop_front();
+            }
+            task(llmExecutor.pipe.get());
+        }
+    }
+
+    static void run(LLMExecutorWrapper* self) {
+        try {
+            if (self->pipeFactory) {
+                auto pipe = self->pipeFactory();
+                if (self->onPipelineCreated) {
+                    self->onPipelineCreated(pipe);
+                }
+                self->llmExecutor.pipe = std::move(pipe);
+            }
+            self->pipelineReady.set_value();
+        } catch (const std::exception& e) {
+            SPDLOG_LOGGER_ERROR(llm_executor_logger, "Error during LLM pipeline initialization on executor thread: {}.", e.what());
+            self->pipelineReady.set_exception(std::current_exception());
+            self->finishExecutorThread = true;
+            self->llmExecutor.notify();
+            return;
+        } catch (...) {
+            self->pipelineReady.set_exception(std::current_exception());
+            self->finishExecutorThread = true;
+            self->llmExecutor.notify();
+            return;
+        }
         const uint8_t printMetricsEveryNumberOfSteps = 10;
         uint8_t stepCounter = 0;
-        while (!(*receivedEndSignal)) {
+        while (!(self->finishExecutorThread)) {
             try {
+                self->drainTasks();
                 if (stepCounter == printMetricsEveryNumberOfSteps) {
-                    llmExecutor->printMetrics();
+                    self->llmExecutor.printMetrics();
                     stepCounter = 0;
                 }
-                if (llmExecutor->hasRequests()) {
+                if (self->llmExecutor.hasRequests() && !self->stepFailed) {
                     stepCounter++;
-                    llmExecutor->step();
+                    self->llmExecutor.step();
+                } else if (self->stepFailed) {
+                    // Pipeline is corrupt (GPU residual state) and cannot be stepped anymore.
+                    // waitForRequests would spin forever because GenAI's own predicate keeps
+                    // observing the unfinished request, so sleep instead. Queued new-request
+                    // tasks are still drained at the top of every iteration (they fail fast).
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 } else {
                     SPDLOG_LOGGER_INFO(llm_executor_logger, "All requests: {}; Scheduled requests: {};", 0, 0);
-                    llmExecutor->waitForRequests(receivedEndSignal);
+                    self->llmExecutor.waitForRequests(&(self->finishExecutorThread), [self] {
+                        std::lock_guard<std::mutex> lock(self->taskMutex);
+                        return !self->pendingTasks.empty();
+                    });
                 }
-            } catch (std::exception& e) {
-                SPDLOG_LOGGER_ERROR(llm_executor_logger, "Error occurred in LLM executor: {}.", e.what());
-                exit(1);
+            } catch (const std::exception& e) {
+                SPDLOG_LOGGER_ERROR(llm_executor_logger,
+                    "LLM pipeline step failed. Stopping pipeline stepping for this servable to prevent further GPU state corruption: {}.",
+                    e.what());
+                self->stepFailed = true;
+                self->cancelActiveHandles();
+                if (self->onStepError) {
+                    try {
+                        self->onStepError();
+                    } catch (...) {
+                    }
+                }
             }
         }
     }
@@ -138,7 +218,16 @@ class LLMExecutorWrapper {
 public:
     LLMExecutorWrapper(std::shared_ptr<ov::genai::ContinuousBatchingPipeline> pipe, bool isDynamicKVCache = false) :
         llmExecutor(std::move(pipe), isDynamicKVCache) {
-        llmExecutorThread = std::thread(LLMExecutorWrapper::run, &llmExecutor, &finishExecutorThread);
+        llmExecutorThread = std::thread(LLMExecutorWrapper::run, this);
+    }
+
+    LLMExecutorWrapper(std::function<std::shared_ptr<ov::genai::ContinuousBatchingPipeline>()> pipeFactory,
+        std::function<void(const std::shared_ptr<ov::genai::ContinuousBatchingPipeline>&)> onPipelineCreated,
+        bool isDynamicKVCache = false) :
+        llmExecutor(nullptr, isDynamicKVCache),
+        pipeFactory(std::move(pipeFactory)),
+        onPipelineCreated(std::move(onPipelineCreated)) {
+        llmExecutorThread = std::thread(LLMExecutorWrapper::run, this);
     }
 
     ~LLMExecutorWrapper() {
@@ -147,8 +236,75 @@ public:
         llmExecutorThread.join();
     }
 
+    std::future<void>& getReadyFuture() {
+        return readyFuture;
+    }
+
     void notifyNewRequestArrived() {
         llmExecutor.notify();
+    }
+
+    template <typename F>
+    std::invoke_result_t<F&, ov::genai::ContinuousBatchingPipeline*> executeSynchronously(F&& task) {
+        using T = std::invoke_result_t<F&, ov::genai::ContinuousBatchingPipeline*>;
+        std::promise<T> promise;
+        std::future<T> future = promise.get_future();
+        auto wrapped = [task = std::move(task), &promise](ov::genai::ContinuousBatchingPipeline* pipe) mutable {
+            try {
+                if constexpr (std::is_void_v<T>) {
+                    task(pipe);
+                    promise.set_value();
+                } else {
+                    promise.set_value(task(pipe));
+                }
+            } catch (...) {
+                promise.set_exception(std::current_exception());
+            }
+        };
+        {
+            std::lock_guard<std::mutex> lock(taskMutex);
+            pendingTasks.push_back(std::move(wrapped));
+        }
+        llmExecutor.notify();
+        return future.get();
+    }
+
+    bool isPipelineFailed() const {
+        return stepFailed.load();
+    }
+
+    void setOnStepError(std::function<void()> callback) {
+        onStepError = std::move(callback);
+    }
+
+    void registerActiveHandle(const ov::genai::GenerationHandle& handle) {
+        std::lock_guard<std::mutex> lock(taskMutex);
+        // Prune handles of already completed requests so the registry does not grow unbounded.
+        activeHandles.erase(
+            std::remove_if(activeHandles.begin(), activeHandles.end(),
+                [](const ov::genai::GenerationHandle& h) {
+                    try {
+                        return h->get_status() != ov::genai::GenerationStatus::RUNNING;
+                    } catch (...) {
+                        return false;
+                    }
+                }),
+            activeHandles.end());
+        activeHandles.push_back(handle);
+    }
+
+    void cancelActiveHandles() {
+        std::vector<ov::genai::GenerationHandle> handles;
+        {
+            std::lock_guard<std::mutex> lock(taskMutex);
+            handles.swap(activeHandles);
+        }
+        for (auto& handle : handles) {
+            try {
+                handle->cancel();
+            } catch (...) {
+            }
+        }
     }
 };
 

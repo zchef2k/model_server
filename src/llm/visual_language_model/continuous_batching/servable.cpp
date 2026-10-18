@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "../../language_model/continuous_batching/llm_executor.hpp"
 #include "src/port/rapidjson_document.hpp"
 #include "src/port/rapidjson_stringbuffer.hpp"
 #include "src/port/rapidjson_writer.hpp"
@@ -58,10 +59,20 @@ void VisualLanguageModelServable::logPerfMetrics(ov::genai::VLMPerfMetrics& perf
 
 absl::Status VisualLanguageModelServable::addRequestToPipeline(std::shared_ptr<ContinuousBatchingServableExecutionContext>& executionContext) {
     auto vlmExecutionContext = std::static_pointer_cast<VisualLanguageModelServableExecutionContext>(executionContext);
-    vlmExecutionContext->generationHandle = properties->pipeline->add_request(currentRequestId++,  // to be removed from API?
-        vlmExecutionContext->inputRequest.promptText, vlmExecutionContext->inputRequest.inputImages,
-        vlmExecutionContext->inputRequest.inputVideos,
-        vlmExecutionContext->inputRequest.generationConfig);
+    uint64_t requestId = currentRequestId++;
+    try {
+        vlmExecutionContext->generationHandle = properties->llmExecutorWrapper->executeSynchronously(
+            [requestId, &vlmExecutionContext](ov::genai::ContinuousBatchingPipeline* pipe) {
+                return pipe->add_request(requestId,
+                    vlmExecutionContext->inputRequest.promptText, vlmExecutionContext->inputRequest.inputImages,
+                    vlmExecutionContext->inputRequest.inputVideos,
+                    vlmExecutionContext->inputRequest.generationConfig);
+            });
+        properties->llmExecutorWrapper->registerActiveHandle(vlmExecutionContext->generationHandle);
+    } catch (const std::exception& e) {
+        SPDLOG_LOGGER_ERROR(llm_calculator_logger, "Failed to add request {} to the pipeline: {}.", requestId, e.what());
+        return absl::InternalError("Failed to add request to the pipeline");
+    }
     return absl::OkStatus();
 }
 
