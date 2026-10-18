@@ -246,10 +246,14 @@ RUN if [ "$ov_use_binary" == "0" ]; then true ; else exit 0 ; fi ; \
     fi
 ARG ov_genai_branch=master
 ARG ov_genai_org=openvinotoolkit
+# Patched GenAI source is copied from the build context (genai_src/) instead of cloned,
+# so the image is built from exactly the reviewed source. ov_genai_org/ov_genai_branch are
+# unused here. Source: openvino.genai @ 033f4227 + dual-GPU HETERO patch series.
+COPY genai_src /openvino_genai
 WORKDIR /openvino_genai/
 # hadolint ignore=DL3003
-RUN --mount=type=secret,id=gitconfig,target=/root/.gitconfig,required=false if [ "$ov_use_binary" == "0" ]; then \
-    git clone https://github.com/$ov_genai_org/openvino.genai /openvino_genai && cd /openvino_genai && git checkout $ov_genai_branch && git submodule update --init --recursive && \
+RUN if [ "$ov_use_binary" == "0" ]; then \
+    cd /openvino_genai && \
     cmake -DCMAKE_BUILD_TYPE=$CMAKE_BUILD_TYPE -DCMAKE_CXX_FLAGS=" ${SDL_OPS} " -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DENABLE_SYSTEM_ICU="True" -DBUILD_TOKENIZERS=OFF -DENABLE_SAMPLES=OFF -DENABLE_TOOLS=OFF -DENABLE_TESTS=OFF -DENABLE_XGRAMMAR=ON -S ./ -B ./build/ && \
     cmake --build ./build/ --parallel $JOBS && cp /openvino_genai/build/openvino_genai/lib*.so* /opt/intel/openvino/runtime/lib/intel64/ && \
     cp -r /openvino_genai/src/cpp/include/* /opt/intel/openvino/runtime/include/ && \
